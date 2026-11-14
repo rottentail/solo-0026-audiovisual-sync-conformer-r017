@@ -8,9 +8,22 @@ import (
 	"github.com/rottentail/solo-0026-audiovisual-sync-conformer/internal/domain"
 )
 
+// AudioClip describes a probed WAV payload. The PCM region is shared with the
+// immutable source payload instead of copied, so probing does not allocate a
+// second buffer proportional to the audio size.
 type AudioClip struct {
-	Info    domain.AudioInfo
-	Samples []int16
+	Info domain.AudioInfo
+	pcm  []byte
+}
+
+// sampleCount reports the number of 16-bit samples across all channels.
+func (clip AudioClip) sampleCount() int {
+	return len(clip.pcm) / 2
+}
+
+// sampleAt returns the little-endian 16-bit sample at the given flat index.
+func (clip AudioClip) sampleAt(index int) int16 {
+	return int16(binary.LittleEndian.Uint16(clip.pcm[index*2 : index*2+2]))
 }
 
 type waveFormat struct {
@@ -96,26 +109,23 @@ func InspectAudio(data []byte) (AudioClip, error) {
 		return AudioClip{}, fmt.Errorf("WAV sample bytes are incomplete")
 	}
 
-	samples := make([]int16, len(pcm)/2)
-	for i := range samples {
-		samples[i] = int16(binary.LittleEndian.Uint16(pcm[i*2 : i*2+2]))
-	}
 	info := describeAudio(
 		int(format.sampleRate),
 		int(format.channels),
-		len(samples)/int(format.channels),
-		samples,
+		len(pcm)/blockAlign,
+		pcm,
 		len(data),
 		DigestBytes(data),
 	)
-	return AudioClip{Info: info, Samples: samples}, nil
+	return AudioClip{Info: info, pcm: pcm}, nil
 }
 
-func describeAudio(sampleRate, channels, frames int, samples []int16, byteCount int, digest string) domain.AudioInfo {
+func describeAudio(sampleRate, channels, frames int, pcm []byte, byteCount int, digest string) domain.AudioInfo {
 	peak := 0.0
 	var squareSum float64
-	for _, sample := range samples {
-		value := float64(sample)
+	sampleCount := len(pcm) / 2
+	for index := 0; index < sampleCount; index++ {
+		value := float64(int16(binary.LittleEndian.Uint16(pcm[index*2 : index*2+2])))
 		if value < 0 {
 			value = -value
 		}
@@ -125,8 +135,8 @@ func describeAudio(sampleRate, channels, frames int, samples []int16, byteCount 
 		squareSum += value * value
 	}
 	rms := 0.0
-	if len(samples) > 0 {
-		rms = math.Sqrt(squareSum / float64(len(samples)))
+	if sampleCount > 0 {
+		rms = math.Sqrt(squareSum / float64(sampleCount))
 	}
 	return domain.AudioInfo{
 		SampleRate: sampleRate,
@@ -162,24 +172,32 @@ func EncodePCM16(sampleRate, channels int, samples []int16) ([]byte, error) {
 	if len(samples)%channels != 0 {
 		return nil, fmt.Errorf("sample count is not channel aligned")
 	}
-	blockAlign := channels * 2
 	dataSize := len(samples) * 2
 	payload := make([]byte, 44+dataSize)
-	copy(payload[0:4], "RIFF")
-	binary.LittleEndian.PutUint32(payload[4:8], uint32(36+dataSize))
-	copy(payload[8:12], "WAVE")
-	copy(payload[12:16], "fmt ")
-	binary.LittleEndian.PutUint32(payload[16:20], 16)
-	binary.LittleEndian.PutUint16(payload[20:22], 1)
-	binary.LittleEndian.PutUint16(payload[22:24], uint16(channels))
-	binary.LittleEndian.PutUint32(payload[24:28], uint32(sampleRate))
-	binary.LittleEndian.PutUint32(payload[28:32], uint32(sampleRate*blockAlign))
-	binary.LittleEndian.PutUint16(payload[32:34], uint16(blockAlign))
-	binary.LittleEndian.PutUint16(payload[34:36], 16)
-	copy(payload[36:40], "data")
-	binary.LittleEndian.PutUint32(payload[40:44], uint32(dataSize))
+	copy(payload[:44], pcm16Header(sampleRate, channels, dataSize))
 	for index, sample := range samples {
 		binary.LittleEndian.PutUint16(payload[44+index*2:46+index*2], uint16(sample))
 	}
 	return payload, nil
+}
+
+// pcm16Header returns the canonical 44-byte RIFF/WAVE header the service emits
+// for 16-bit PCM. Every encoder path uses it so output bytes stay identical.
+func pcm16Header(sampleRate, channels, dataSize int) []byte {
+	blockAlign := channels * 2
+	header := make([]byte, 44)
+	copy(header[0:4], "RIFF")
+	binary.LittleEndian.PutUint32(header[4:8], uint32(36+dataSize))
+	copy(header[8:12], "WAVE")
+	copy(header[12:16], "fmt ")
+	binary.LittleEndian.PutUint32(header[16:20], 16)
+	binary.LittleEndian.PutUint16(header[20:22], 1)
+	binary.LittleEndian.PutUint16(header[22:24], uint16(channels))
+	binary.LittleEndian.PutUint32(header[24:28], uint32(sampleRate))
+	binary.LittleEndian.PutUint32(header[28:32], uint32(sampleRate*blockAlign))
+	binary.LittleEndian.PutUint16(header[32:34], uint16(blockAlign))
+	binary.LittleEndian.PutUint16(header[34:36], 16)
+	copy(header[36:40], "data")
+	binary.LittleEndian.PutUint32(header[40:44], uint32(dataSize))
+	return header
 }

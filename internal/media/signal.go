@@ -44,7 +44,8 @@ func AnalyzeSync(audioData, videoData []byte) (domain.Measurement, error) {
 }
 
 func detectAudioOnset(clip AudioClip) (int, float64, error) {
-	if len(clip.Samples) == 0 {
+	sampleCount := clip.sampleCount()
+	if sampleCount == 0 {
 		return 0, 0, fmt.Errorf("audio payload has no samples")
 	}
 	windowFrames := clip.Info.SampleRate / 200
@@ -52,11 +53,11 @@ func detectAudioOnset(clip AudioClip) (int, float64, error) {
 		windowFrames = 1
 	}
 	windowSamples := windowFrames * clip.Info.Channels
-	windowRMS := make([]float64, 0, len(clip.Samples)/windowSamples)
-	for start := 0; start+windowSamples <= len(clip.Samples); start += windowSamples {
+	windowRMS := make([]float64, 0, sampleCount/windowSamples)
+	for start := 0; start+windowSamples <= sampleCount; start += windowSamples {
 		var sum float64
-		for _, sample := range clip.Samples[start : start+windowSamples] {
-			value := float64(sample)
+		for index := start; index < start+windowSamples; index++ {
+			value := float64(clip.sampleAt(index))
 			sum += value * value
 		}
 		windowRMS = append(windowRMS, math.Sqrt(sum/float64(windowSamples)))
@@ -96,8 +97,8 @@ func detectAudioOnset(clip AudioClip) (int, float64, error) {
 	}
 	startSample := eventWindow * windowSamples
 	precise := startSample
-	for precise < len(clip.Samples) {
-		value := math.Abs(float64(clip.Samples[precise]))
+	for precise < sampleCount {
+		value := math.Abs(float64(clip.sampleAt(precise)))
 		if value >= peak*0.12 {
 			break
 		}

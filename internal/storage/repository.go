@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"time"
@@ -273,10 +274,53 @@ func (r *Repository) UpdateConform(record domain.ConformJob) error {
 	return r.writeConform(record)
 }
 
+// ConformStaging is a private temporary directory where a conform bundle is
+// rendered before the atomic directory rename publishes it. Content inside
+// the staging directory is never visible to readers, and Abort removes it
+// unless a commit has consumed it.
+type ConformStaging struct {
+	dir string
+}
+
+// StageConform creates the private staging directory for a conform bundle.
+func (r *Repository) StageConform(id string) (*ConformStaging, error) {
+	tempDir, err := os.MkdirTemp(filepath.Join(r.root, "tmp"), "conform-"+id+"-*")
+	if err != nil {
+		return nil, fmt.Errorf("create bundle staging directory: %w", err)
+	}
+	return &ConformStaging{dir: tempDir}, nil
+}
+
+// CreateBundle opens the staged bundle archive for exclusive writing.
+func (s *ConformStaging) CreateBundle() (*os.File, error) {
+	handle, err := os.OpenFile(filepath.Join(s.dir, "bundle.zip"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("create staged bundle: %w", err)
+	}
+	return handle, nil
+}
+
+// WriteReceipt stores the staged receipt next to the staged bundle.
+func (s *ConformStaging) WriteReceipt(data []byte) error {
+	return writeFileAtomic(filepath.Join(s.dir, "receipt.json"), data)
+}
+
+// Abort removes the staging directory unless it was committed. It is safe to
+// call after a successful commit.
+func (s *ConformStaging) Abort() {
+	if s.dir == "" {
+		return
+	}
+	os.RemoveAll(s.dir)
+	s.dir = ""
+}
+
+// CommitConform publishes the staged bundle directory with one atomic rename
+// and marks the job completed. The staged content becomes visible only as a
+// whole; a failed commit leaves no readable bundle behind.
 func (r *Repository) CommitConform(
 	record domain.ConformJob,
-	bundle []byte,
-	receipt []byte,
+	staging *ConformStaging,
 ) (domain.ConformJob, error) {
 	lock := r.locks.forKey("conform:" + record.ID)
 	lock.Lock()
@@ -293,22 +337,11 @@ func (r *Repository) CommitConform(
 			current.State,
 		)
 	}
-	tempDir, err := os.MkdirTemp(filepath.Join(r.root, "tmp"), "conform-"+record.ID+"-*")
-	if err != nil {
-		return domain.ConformJob{}, fmt.Errorf("create bundle staging directory: %w", err)
-	}
-	defer os.RemoveAll(tempDir)
-	if err := writeFileAtomic(filepath.Join(tempDir, "bundle.zip"), bundle); err != nil {
-		return domain.ConformJob{}, err
-	}
-	if err := writeFileAtomic(filepath.Join(tempDir, "receipt.json"), receipt); err != nil {
-		return domain.ConformJob{}, err
-	}
-	if err := syncDirectory(tempDir); err != nil {
+	if err := syncDirectory(staging.dir); err != nil {
 		return domain.ConformJob{}, fmt.Errorf("sync bundle staging directory: %w", err)
 	}
 	finalDir := r.bundleDir(record.ID)
-	if err := os.Rename(tempDir, finalDir); err != nil {
+	if err := os.Rename(staging.dir, finalDir); err != nil {
 		if errors.Is(err, os.ErrExist) {
 			return domain.ConformJob{}, domain.NewError(
 				"conform_bundle_conflict",
@@ -319,6 +352,7 @@ func (r *Repository) CommitConform(
 		}
 		return domain.ConformJob{}, fmt.Errorf("commit bundle directory: %w", err)
 	}
+	staging.dir = ""
 	record.State = domain.ConformStateCompleted
 	record.UpdatedAt = time.Now().UTC()
 	if err := r.writeConform(record); err != nil {
@@ -328,35 +362,52 @@ func (r *Repository) CommitConform(
 	return record, nil
 }
 
-func (r *Repository) ReadConformBundle(id string) ([]byte, domain.ConformReceipt, error) {
+// OpenConformBundle verifies the stored bundle against its completed record
+// and returns an open handle positioned at the start of the archive. The
+// digest and byte-count checks are exactly the ones previously applied to the
+// fully buffered bundle, but the file is streamed instead of read into
+// memory. The caller owns the returned handle.
+func (r *Repository) OpenConformBundle(id string) (*os.File, domain.ConformReceipt, int64, error) {
 	record, err := r.GetConform(id)
 	if err != nil {
-		return nil, domain.ConformReceipt{}, err
+		return nil, domain.ConformReceipt{}, 0, err
 	}
 	if record.State != domain.ConformStateCompleted {
-		return nil, domain.ConformReceipt{}, domain.NewError(
+		return nil, domain.ConformReceipt{}, 0, domain.NewError(
 			"conform_not_ready",
 			409,
 			"conform %s is not completed",
 			id,
 		)
 	}
-	bundle, err := os.ReadFile(filepath.Join(r.bundleDir(id), "bundle.zip"))
+	bundlePath := filepath.Join(r.bundleDir(id), "bundle.zip")
+	handle, err := os.Open(bundlePath)
 	if err != nil {
-		return nil, domain.ConformReceipt{}, fmt.Errorf("read conform bundle: %w", err)
+		return nil, domain.ConformReceipt{}, 0, fmt.Errorf("read conform bundle: %w", err)
 	}
-	if len(bundle) != record.BundleBytes || shaOrEmpty(bundle) != record.BundleDigest {
-		return nil, domain.ConformReceipt{}, domain.NewError(
+	size, digest, err := digestStream(handle)
+	if err != nil {
+		handle.Close()
+		return nil, domain.ConformReceipt{}, 0, fmt.Errorf("read conform bundle: %w", err)
+	}
+	if size != int64(record.BundleBytes) || digest != record.BundleDigest {
+		handle.Close()
+		return nil, domain.ConformReceipt{}, 0, domain.NewError(
 			"bundle_integrity_failed",
 			500,
 			"stored bundle does not match its completed record",
 		)
 	}
+	if _, err := handle.Seek(0, io.SeekStart); err != nil {
+		handle.Close()
+		return nil, domain.ConformReceipt{}, 0, fmt.Errorf("read conform bundle: %w", err)
+	}
 	var receipt domain.ConformReceipt
 	if err := readJSON(filepath.Join(r.bundleDir(id), "receipt.json"), &receipt); err != nil {
-		return nil, domain.ConformReceipt{}, fmt.Errorf("read conform receipt: %w", err)
+		handle.Close()
+		return nil, domain.ConformReceipt{}, 0, fmt.Errorf("read conform receipt: %w", err)
 	}
-	return bundle, receipt, nil
+	return handle, receipt, size, nil
 }
 
 func (r *Repository) writeConform(record domain.ConformJob) error {

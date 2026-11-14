@@ -1,8 +1,8 @@
 package service
 
 import (
-	"encoding/base64"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/rottentail/solo-0026-audiovisual-sync-conformer/internal/domain"
@@ -26,19 +26,27 @@ func (s *Service) CreateTake(input domain.CreateTakeInput) (domain.TakeResult, e
 	if err := domain.ValidateCreateTake(input); err != nil {
 		return domain.TakeResult{}, err
 	}
-	audio, err := decodePayload("audio_base64", input.AudioBase64, domain.MaxAudioBytes)
-	if err != nil {
-		return domain.TakeResult{}, err
+	if len(input.Audio) > domain.MaxAudioBytes {
+		return domain.TakeResult{}, domain.NewError(
+			"payload_too_large",
+			413,
+			"audio_base64 exceeds the %d byte limit",
+			domain.MaxAudioBytes,
+		)
 	}
-	video, err := decodePayload("video_base64", input.VideoBase64, domain.MaxVideoBytes)
-	if err != nil {
-		return domain.TakeResult{}, err
+	if len(input.Video) > domain.MaxVideoBytes {
+		return domain.TakeResult{}, domain.NewError(
+			"payload_too_large",
+			413,
+			"video_base64 exceeds the %d byte limit",
+			domain.MaxVideoBytes,
+		)
 	}
-	audioClip, err := media.InspectAudio(audio)
+	audioClip, err := media.InspectAudio(input.Audio)
 	if err != nil {
 		return domain.TakeResult{}, domain.NewError("invalid_audio", 422, "%s", err)
 	}
-	videoClip, err := media.InspectVideo(video)
+	videoClip, err := media.InspectVideo(input.Video)
 	if err != nil {
 		return domain.TakeResult{}, domain.NewError("invalid_video", 422, "%s", err)
 	}
@@ -58,7 +66,7 @@ func (s *Service) CreateTake(input domain.CreateTakeInput) (domain.TakeResult, e
 		record.Audio.Digest,
 		record.Video.Digest,
 	)
-	admitted, created, err := s.repository.AdmitTake(record, audio, video)
+	admitted, created, err := s.repository.AdmitTake(record, input.Audio, input.Video)
 	if err != nil {
 		return domain.TakeResult{}, err
 	}
@@ -243,11 +251,11 @@ func (s *Service) renderConform(record domain.ConformJob) (domain.ConformResult,
 	if err != nil {
 		return s.failConform(record, "take_media_unavailable", err.Error())
 	}
-	alignedAudio, err := media.AlignAudio(audio, record.MeasuredOffsetMS, record.MaxCorrectionMS)
+	audioClip, frameDelta, err := media.CheckAlignment(audio, record.MeasuredOffsetMS, record.MaxCorrectionMS)
 	if err != nil {
 		return s.failConform(record, domain.AsError(err).Code, domain.AsError(err).Message)
 	}
-	conformedVideo, videoInfo, err := media.NormalizeY4M(video)
+	videoClip, err := media.InspectVideo(video)
 	if err != nil {
 		return s.failConform(record, "video_conform_failed", err.Error())
 	}
@@ -256,9 +264,7 @@ func (s *Service) renderConform(record domain.ConformJob) (domain.ConformResult,
 		return s.failConform(record, "take_media_unavailable", err.Error())
 	}
 	record.AppliedOffsetMS = record.MeasuredOffsetMS
-	record.AppliedSamples = alignedAudio.AppliedSamples
-	record.AudioOutputDigest = alignedAudio.Digest
-	record.VideoOutputDigest = videoInfo.Digest
+	record.AppliedSamples = frameDelta
 	receipt := domain.ConformReceipt{
 		SchemaVersion:    1,
 		ConformID:        record.ID,
@@ -267,27 +273,67 @@ func (s *Service) renderConform(record domain.ConformJob) (domain.ConformResult,
 		MeasuredOffsetMS: record.MeasuredOffsetMS,
 		AppliedOffsetMS:  record.AppliedOffsetMS,
 		AppliedSamples:   record.AppliedSamples,
-		AudioDigest:      alignedAudio.Digest,
-		VideoDigest:      videoInfo.Digest,
 		InputTakeDigest:  take.Digest,
 		CreatedAt:        record.CreatedAt,
 	}
-	bundle, receiptData, err := media.BuildReviewBundle(alignedAudio.WAV, conformedVideo, receipt)
+	staging, err := s.repository.StageConform(record.ID)
+	if err != nil {
+		return s.failConform(record, "bundle_commit_failed", err.Error())
+	}
+	defer staging.Abort()
+	result, bundleDigest, bundleBytes, err := s.writeBundle(staging, media.ReviewBundleSpec{
+		Audio:          audioClip,
+		AppliedSamples: frameDelta,
+		Video:          videoClip,
+		Receipt:        receipt,
+	})
 	if err != nil {
 		return s.failConform(record, "bundle_build_failed", err.Error())
 	}
-	record.BundleDigest = media.DigestBytes(bundle)
-	record.BundleBytes = len(bundle)
+	record.AudioOutputDigest = result.AudioDigest
+	record.VideoOutputDigest = result.VideoDigest
+	record.BundleDigest = bundleDigest
+	record.BundleBytes = int(bundleBytes)
 	record.State = domain.ConformStateCommitting
 	record.UpdatedAt = time.Now().UTC()
 	if err := s.repository.UpdateConform(record); err != nil {
 		return domain.ConformResult{}, err
 	}
-	completed, err := s.repository.CommitConform(record, bundle, receiptData)
+	completed, err := s.repository.CommitConform(record, staging)
 	if err != nil {
 		return s.failConform(record, "bundle_commit_failed", err.Error())
 	}
 	return domain.ConformResult{Conform: completed, Created: true}, nil
+}
+
+// writeBundle streams the review ZIP into the staging directory while
+// hashing the archive, then stores the receipt beside it. Nothing is visible
+// outside the staging directory until the atomic commit.
+func (s *Service) writeBundle(
+	staging *storage.ConformStaging,
+	spec media.ReviewBundleSpec,
+) (media.ReviewBundleResult, string, int64, error) {
+	handle, err := staging.CreateBundle()
+	if err != nil {
+		return media.ReviewBundleResult{}, "", 0, err
+	}
+	digest := media.NewHashWriter(handle)
+	result, err := media.WriteReviewBundle(digest, spec)
+	if err != nil {
+		handle.Close()
+		return media.ReviewBundleResult{}, "", 0, err
+	}
+	if err := handle.Sync(); err != nil {
+		handle.Close()
+		return media.ReviewBundleResult{}, "", 0, fmt.Errorf("flush staged bundle: %w", err)
+	}
+	if err := handle.Close(); err != nil {
+		return media.ReviewBundleResult{}, "", 0, fmt.Errorf("close staged bundle: %w", err)
+	}
+	if err := staging.WriteReceipt(result.ReceiptData); err != nil {
+		return media.ReviewBundleResult{}, "", 0, err
+	}
+	return result, digest.Digest(), digest.Bytes(), nil
 }
 
 func (s *Service) failConform(
@@ -312,31 +358,14 @@ func (s *Service) GetConform(id string) (domain.ConformJob, error) {
 	return s.repository.GetConform(id)
 }
 
-func (s *Service) ReadConformBundle(id string) ([]byte, domain.ConformReceipt, error) {
+// OpenConformBundle verifies the stored bundle and returns an open stream for
+// it. The integrity check is identical to the previous buffered read, but the
+// archive is served from disk without an in-memory copy.
+func (s *Service) OpenConformBundle(id string) (io.ReadCloser, domain.ConformReceipt, int64, error) {
 	if err := domain.ValidateIdentifier("conform_id", id); err != nil {
-		return nil, domain.ConformReceipt{}, err
+		return nil, domain.ConformReceipt{}, 0, err
 	}
-	return s.repository.ReadConformBundle(id)
-}
-
-func decodePayload(field, encoded string, maximum int) ([]byte, error) {
-	data, err := base64.StdEncoding.Strict().DecodeString(encoded)
-	if err != nil {
-		return nil, domain.NewError("invalid_base64", 400, "%s is not valid base64", field)
-	}
-	if len(data) == 0 {
-		return nil, domain.NewError("invalid_request", 400, "%s is empty", field)
-	}
-	if len(data) > maximum {
-		return nil, domain.NewError(
-			"payload_too_large",
-			413,
-			"%s exceeds the %d byte limit",
-			field,
-			maximum,
-		)
-	}
-	return data, nil
+	return s.repository.OpenConformBundle(id)
 }
 
 func intPointer(value int) *int {

@@ -15,12 +15,15 @@ type API struct {
 	service *appservice.Service
 }
 
+// createTakeRequest carries the decoded take payload. The media fields hold
+// raw bytes: the JSON base64 strings are decoded while the request streams
+// in, so they are never materialized as strings.
 type createTakeRequest struct {
-	TakeID      string `json:"take_id"`
-	Name        string `json:"name"`
-	Note        string `json:"note"`
-	AudioBase64 string `json:"audio_base64"`
-	VideoBase64 string `json:"video_base64"`
+	TakeID string
+	Name   string
+	Note   string
+	Audio  []byte
+	Video  []byte
 }
 
 type createAnalysisRequest struct {
@@ -56,17 +59,17 @@ func (api *API) health(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (api *API) createTake(w http.ResponseWriter, request *http.Request) {
-	var payload createTakeRequest
-	if err := decodeJSON(w, request, &payload); err != nil {
+	payload, err := decodeTakeRequest(w, request)
+	if err != nil {
 		writeFailure(w, err)
 		return
 	}
 	result, err := api.service.CreateTake(domain.CreateTakeInput{
-		TakeID:      payload.TakeID,
-		Name:        payload.Name,
-		Note:        payload.Note,
-		AudioBase64: payload.AudioBase64,
-		VideoBase64: payload.VideoBase64,
+		TakeID: payload.TakeID,
+		Name:   payload.Name,
+		Note:   payload.Note,
+		Audio:  payload.Audio,
+		Video:  payload.Video,
 	})
 	if err != nil {
 		writeFailure(w, err)
@@ -163,19 +166,20 @@ func (api *API) getConform(w http.ResponseWriter, request *http.Request) {
 
 func (api *API) getBundle(w http.ResponseWriter, request *http.Request) {
 	id := request.PathValue("conform_id")
-	bundle, receipt, err := api.service.ReadConformBundle(id)
+	bundle, receipt, size, err := api.service.OpenConformBundle(id)
 	if err != nil {
 		writeFailure(w, err)
 		return
 	}
+	defer bundle.Close()
 	w.Header().Set("Content-Type", "application/zip")
 	w.Header().Set(
 		"Content-Disposition",
 		fmt.Sprintf(`attachment; filename="%s-review.zip"`, receipt.ConformID),
 	)
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(bundle)))
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", size))
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(bundle)
+	_, _ = io.Copy(w, bundle)
 }
 
 func decodeJSON(w http.ResponseWriter, request *http.Request, target any) error {

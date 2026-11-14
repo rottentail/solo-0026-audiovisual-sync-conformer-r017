@@ -34,7 +34,7 @@ func ValidateCreateTake(input CreateTakeInput) error {
 	if len([]rune(input.Note)) > MaxTakeNoteRunes {
 		return NewError("invalid_request", 400, "note is too long")
 	}
-	if input.AudioBase64 == "" || input.VideoBase64 == "" {
+	if len(input.Audio) == 0 || len(input.Video) == 0 {
 		return NewError("invalid_request", 400, "audio_base64 and video_base64 are required")
 	}
 	return nil

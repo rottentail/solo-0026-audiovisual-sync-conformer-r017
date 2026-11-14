@@ -3,12 +3,15 @@ package media
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 
 	"github.com/rottentail/solo-0026-audiovisual-sync-conformer/internal/domain"
 )
 
+// VideoClip describes a probed Y4M payload. Frames alias the immutable source
+// payload, so probing and re-emitting do not allocate per-frame copies.
 type VideoClip struct {
 	Info   domain.VideoInfo
 	Frames [][]byte
@@ -55,9 +58,7 @@ func InspectVideo(data []byte) (VideoClip, error) {
 		if bodyEnd > len(data) {
 			return VideoClip{}, fmt.Errorf("Y4M frame payload is truncated")
 		}
-		frame := make([]byte, frameBytes)
-		copy(frame, data[bodyStart:bodyEnd])
-		frames = append(frames, frame)
+		frames = append(frames, data[bodyStart:bodyEnd])
 		if len(frames) > domain.MaxVideoFrames {
 			return VideoClip{}, fmt.Errorf("Y4M frame count exceeds the limit")
 		}
@@ -146,45 +147,46 @@ func parseY4MHeader(line string) (parsedHeader, error) {
 }
 
 func EncodeY4M(info domain.VideoInfo, frames [][]byte) ([]byte, error) {
+	var output bytes.Buffer
+	if err := WriteY4M(&output, info, frames); err != nil {
+		return nil, err
+	}
+	return output.Bytes(), nil
+}
+
+// WriteY4M streams the canonical Y4M encoding of the given frames to w. It
+// emits exactly the bytes EncodeY4M produces without materializing a second
+// copy of the picture in memory.
+func WriteY4M(w io.Writer, info domain.VideoInfo, frames [][]byte) error {
 	if info.Width <= 0 || info.Height <= 0 || info.FPSNum <= 0 || info.FPSDen <= 0 {
-		return nil, fmt.Errorf("invalid Y4M output geometry")
+		return fmt.Errorf("invalid Y4M output geometry")
 	}
 	chroma := info.Chroma
 	if chroma == "" {
 		chroma = "C420jpeg"
 	}
 	frameBytes := info.Width*info.Height + 2*(info.Width/2)*(info.Height/2)
-	var output bytes.Buffer
-	fmt.Fprintf(
-		&output,
+	if _, err := fmt.Fprintf(
+		w,
 		"YUV4MPEG2 W%d H%d F%d:%d Ip A0:0 %s\n",
 		info.Width,
 		info.Height,
 		info.FPSNum,
 		info.FPSDen,
 		chroma,
-	)
+	); err != nil {
+		return err
+	}
 	for _, frame := range frames {
 		if len(frame) != frameBytes {
-			return nil, fmt.Errorf("Y4M frame byte count does not match geometry")
+			return fmt.Errorf("Y4M frame byte count does not match geometry")
 		}
-		output.WriteString("FRAME\n")
-		output.Write(frame)
+		if _, err := io.WriteString(w, "FRAME\n"); err != nil {
+			return err
+		}
+		if _, err := w.Write(frame); err != nil {
+			return err
+		}
 	}
-	return output.Bytes(), nil
-}
-
-func NormalizeY4M(data []byte) ([]byte, domain.VideoInfo, error) {
-	clip, err := InspectVideo(data)
-	if err != nil {
-		return nil, domain.VideoInfo{}, err
-	}
-	output, err := EncodeY4M(clip.Info, clip.Frames)
-	if err != nil {
-		return nil, domain.VideoInfo{}, err
-	}
-	info := clip.Info
-	info.Digest = DigestBytes(output)
-	info.ByteCount = len(output)
-	return output, info, nil
+	return nil
 }

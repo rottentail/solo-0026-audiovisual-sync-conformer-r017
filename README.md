@@ -15,6 +15,23 @@ The implementation includes:
 - per-identifier locking and atomic directory publication;
 - a deterministic ZIP bundle with a matching receipt.
 
+## Resource profile
+
+The request pipeline is streaming end to end so concurrent takes do not stack
+large intermediate buffers:
+
+- take admission decodes the base64 media fields while the JSON body streams
+  in, without materializing the encoded strings or a decoder buffer;
+- media probing aliases the immutable payloads instead of copying samples or
+  frames, and onset/flash measurement reads them in place;
+- conform rendering streams the aligned WAV and normalized Y4M straight into
+  the staged ZIP while hashing, so the bundle never exists as a whole in
+  memory, and the bundle route streams the verified archive from disk.
+
+Every digest, descriptor, and archive byte is identical to a fully buffered
+pipeline; only the peak memory changes. Operators can still tune GC pacing
+with the standard `GOGC`/`GOMEMLIMIT` environment variables.
+
 Automated tests are intentionally deferred. A later task stage will add the
 test suite, fixtures, race checks, and test command. This baseline ships
 production workflow checks that exercise the implemented routes.

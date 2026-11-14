@@ -94,11 +94,11 @@ type ConformReceipt struct {
 }
 
 type CreateTakeInput struct {
-	TakeID      string
-	Name        string
-	Note        string
-	AudioBase64 string
-	VideoBase64 string
+	TakeID string
+	Name   string
+	Note   string
+	Audio  []byte
+	Video  []byte
 }
 
 type CreateAnalysisInput struct {
